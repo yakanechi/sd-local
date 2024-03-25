@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/screwdriver-cd/sd-local/screwdriver"
 	"github.com/sirupsen/logrus"
 )
 

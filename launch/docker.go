@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/screwdriver-cd/sd-local/screwdriver"
 	"io"
 	"os"
 	"os/exec"
@@ -14,7 +15,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/screwdriver-cd/sd-local/screwdriver"
 	"github.com/sirupsen/logrus"
 )
 
@@ -113,69 +113,70 @@ func (d *docker) setupBin() error {
 	return nil
 }
 
-func (d *docker) runBuild(buildEntry buildEntry) error {
-	if d.dind.enabled {
-		if err := d.runDinD(); err != nil {
-			return fmt.Errorf("failed to prepare dind container: %v", err)
-		}
-	}
-
+func (d *docker) makeDockerVolumeOptions(buildEntry buildEntry) []string {
 	environment := buildEntry.Environment
 
 	srcDir := buildEntry.SrcPath
 	hostArtDir := buildEntry.ArtifactsPath
 	containerArtDir := GetEnv(environment, "SD_ARTIFACTS_DIR")
-	buildImage := buildEntry.Image
-	logfilePath := filepath.Join(containerArtDir, LogFile)
 
 	srcVol := fmt.Sprintf("%s/:/sd/workspace/src/%s/%s", srcDir, scmHost, orgRepo)
 	artVol := fmt.Sprintf("%s/:%s", hostArtDir, containerArtDir)
 	binVol := fmt.Sprintf("%s:%s", d.volume, "/opt/sd")
 	habVol := fmt.Sprintf("%s:%s", d.habVolume, "/opt/sd/hab")
 
+	var options []string
 	dockerVolumes := append(d.localVolumes, srcVol, artVol, binVol, habVol, fmt.Sprintf("%s:/tmp/auth.sock:rw", d.socketPath))
+	for _, v := range dockerVolumes {
+		options = append(options, "-v", v)
+	}
+	return options
+}
+
+func (d *docker) makeLaunchCommands(buildEntry buildEntry) ([]string, error) {
+	environment := buildEntry.Environment
+	containerArtDir := GetEnv(environment, "SD_ARTIFACTS_DIR")
+	logfilePath := filepath.Join(containerArtDir, LogFile)
 
 	// Overwrite steps for sd-local interact mode. The env will load later.
+	var configJSONArg string
 	if d.interactiveMode {
-		buildEntry.Steps = []screwdriver.Step{
+		interactiveBuildEntry := buildEntry
+		interactiveBuildEntry.Steps = []screwdriver.Step{
 			{
 				Name:    "sd-local-init",
 				Command: "export > /tmp/sd-local.env",
 			},
 		}
-	}
-
-	configJSON, err := json.Marshal(buildEntry)
-	if err != nil {
-		return err
-	}
-
-	if !d.noImagePull {
-		logrus.Infof("Pulling docker image from %s...", buildImage)
-		_, err = d.execDockerCommand("pull", buildImage)
+		configJSON, err := json.Marshal(interactiveBuildEntry)
 		if err != nil {
-			return fmt.Errorf("failed to pull user image %v", err)
+			return []string{}, err
 		}
+		configJSONArg = fmt.Sprintf("%q", string(configJSON))
+	} else {
+		configJSON, err := json.Marshal(buildEntry)
+		if err != nil {
+			return []string{}, err
+		}
+		configJSONArg = string(configJSON)
 	}
-
-	dockerCommandArgs := []string{"container", "run"}
-	dockerCommandOptions := []string{"--rm"}
-	dockerCommandOptions = append(dockerCommandOptions, "--pull", "never")
-	for _, v := range dockerVolumes {
-		dockerCommandOptions = append(dockerCommandOptions, "-v", v)
-	}
-	dockerCommandOptions = append(dockerCommandOptions, "--entrypoint", "/bin/sh")
-	dockerCommandOptions = append(dockerCommandOptions, "-e", "SSH_AUTH_SOCK=/tmp/auth.sock", buildImage)
-	configJSONArg := string(configJSON)
-	if d.interactiveMode {
-		configJSONArg = fmt.Sprintf("%q", configJSONArg)
-	}
+	logrus.Infof("configJSON %s", configJSONArg)
 	launchCommands := []string{"/opt/sd/local_run.sh", configJSONArg, buildEntry.JobName, GetEnv(environment, "SD_API_URL"), GetEnv(environment, "SD_STORE_URL"), logfilePath}
+
+	return launchCommands, nil
+}
+
+func (d *docker) makeDockerOptions(buildEntry buildEntry) ([]string, error) {
+	dockerVolumeOptions := d.makeDockerVolumeOptions(buildEntry)
+
+	dockerCommandOptions := []string{"--rm"}
+	//dockerCommandOptions = []string{"--name", "sd-local"}
+	dockerCommandOptions = append(dockerCommandOptions, "--pull", "never")
+	dockerCommandOptions = append(dockerCommandOptions, dockerVolumeOptions...)
+	dockerCommandOptions = append(dockerCommandOptions, "--entrypoint", "/bin/sh")
+	dockerCommandOptions = append(dockerCommandOptions, "-e", "SSH_AUTH_SOCK=/tmp/auth.sock", buildEntry.Image)
 	if d.interactiveMode {
 		dockerCommandOptions = append([]string{"-itd"}, dockerCommandOptions...)
-
-	} else {
-		dockerCommandOptions = append(dockerCommandOptions, launchCommands...)
 	}
 
 	if buildEntry.MemoryLimit != "" {
@@ -201,8 +202,43 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 			dockerCommandOptions...)
 	}
 
+	if d.interactiveMode {
+		for _, step := range buildEntry.Steps {
+			value := fmt.Sprintf("SD_LOCAL_INTERACTIVE_STEP_%s=%s", strings.ToUpper(step.Name), step.Command)
+			dockerCommandOptions = append([]string{"-e", value}, dockerCommandOptions...)
+			logrus.Infof("value: %s", value)
+		}
+	}
+
 	if d.buildUser != "" {
 		dockerCommandOptions = append([]string{fmt.Sprintf("-u%s", d.buildUser)}, dockerCommandOptions...)
+	}
+	return dockerCommandOptions, nil
+}
+
+func (d *docker) runBuild(buildEntry buildEntry) error {
+	if d.dind.enabled {
+		if err := d.runDinD(); err != nil {
+			return fmt.Errorf("failed to prepare dind container: %v", err)
+		}
+	}
+
+	if !d.noImagePull {
+		logrus.Infof("Pulling docker image from %s...", buildEntry.Image)
+		_, err := d.execDockerCommand("pull", buildEntry.Image)
+		if err != nil {
+			return fmt.Errorf("failed to pull user image %v", err)
+		}
+	}
+
+	dockerCommandArgs := []string{"container", "run"}
+	dockerCommandOptions, err := d.makeDockerOptions(buildEntry)
+	if err != nil {
+		return err
+	}
+	launchCommands, err := d.makeLaunchCommands(buildEntry)
+	if err != nil {
+		return err
 	}
 
 	if d.interactiveMode {
@@ -213,6 +249,17 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 		}
 
 		attachCommands := []string{"attach", cid}
+		sdRunCommand := strings.Join([]string{
+			"#!/bin/sh",
+			"step_name=\"$1\"",
+			"env_name=SD_LOCAL_INTERACTIVE_STEP_$(echo \"${step_name}\" | tr '[:lower:]' '[:upper:]')",
+			"command_all=\"${!env_name}\"",
+			`IFS=$'\'\\\\n\'' commands=(${command_all})`,
+			"for command in \"${commands[@]}\"; do",
+			"    echo \"${step_name}: ${command}\"",
+			"    echo \"${step_name}: $(eval \"${command}\")\"",
+			"done",
+		}, "\n")
 		commands := [][]string{
 			launchCommands,
 			{"set", "-a"},
@@ -220,14 +267,17 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 			{"set", "+a"},
 			{"export", "PS1='sd-local# '"},
 			{"cd", "$SD_CHECKOUT_DIR"},
+			{"echo", "-e", fmt.Sprintf("'%s'", sdRunCommand), ">", "/usr/local/bin/sd-run"},
+			{"chmod", "+x", "/usr/local/bin/sd-run"},
 		}
+		logrus.Infof("commands: %s", commands)
 		err = d.attachDockerCommand(attachCommands, commands)
 		if err != nil {
 			return fmt.Errorf("failed to attach build container: %v", err)
 		}
 	} else {
 		// run for sd-local build mode
-		_, err = d.execDockerCommand(append(dockerCommandArgs, dockerCommandOptions...)...)
+		_, err = d.execDockerCommand(append(append(dockerCommandArgs, dockerCommandOptions...), launchCommands...)...)
 		if err != nil {
 			return fmt.Errorf("failed to run build container: %v", err)
 		}

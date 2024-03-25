@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"github.com/screwdriver-cd/sd-local/screwdriver"
 	"io"
 	"os"
 	"os/exec"

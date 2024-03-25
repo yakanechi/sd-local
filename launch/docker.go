@@ -269,6 +269,7 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 			{"cd", "$SD_CHECKOUT_DIR"},
 			{"echo", "-e", fmt.Sprintf("'%s'", sdRunCommand), ">", "/usr/local/bin/sd-run"},
 			{"chmod", "+x", "/usr/local/bin/sd-run"},
+			{"history", "-c"},
 		}
 		logrus.Infof("commands: %s", commands)
 		err = d.attachDockerCommand(attachCommands, commands)

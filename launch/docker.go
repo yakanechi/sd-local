@@ -254,11 +254,9 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 			"step_name=\"$1\"",
 			"env_name=SD_LOCAL_INTERACTIVE_STEP_$(echo \"${step_name}\" | tr '[:lower:]' '[:upper:]')",
 			"command_all=\"${!env_name}\"",
-			`IFS=$'\'\\\\n\'' commands=(${command_all})`,
-			"for command in \"${commands[@]}\"; do",
-			"    echo \"${step_name}: ${command}\"",
-			"    echo \"${step_name}: $(eval \"${command}\")\"",
-			"done",
+			"echo -e \"${command_all}\" > /sd/sd_step.sh",
+			"cat /sd/sd_step.sh",
+			"source /sd/sd_step.sh",
 		}, "\n")
 		commands := [][]string{
 			launchCommands,
@@ -267,8 +265,9 @@ func (d *docker) runBuild(buildEntry buildEntry) error {
 			{"set", "+a"},
 			{"export", "PS1='sd-local# '"},
 			{"cd", "$SD_CHECKOUT_DIR"},
-			{"echo", "-e", fmt.Sprintf("'%s'", sdRunCommand), ">", "/usr/local/bin/sd-run"},
-			{"chmod", "+x", "/usr/local/bin/sd-run"},
+			{"echo", "-e", fmt.Sprintf("'%s'", sdRunCommand), ">", "/sd/sd-run"},
+			{"chmod", "+x", "/sd/sd-run"},
+			{"alias", "sd-run=\"source /sd/sd-run\""},
 			{"history", "-c"},
 		}
 		logrus.Infof("commands: %s", commands)
